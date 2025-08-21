@@ -280,4 +280,3 @@ st.write(f"""
 - **Suitability:** **{score}/100**
 """)
 st.caption("Note: Estimates are indicative. On-site shading analysis and structural checks are recommended before installation.")
-indicative. On-site shading analysis and structural checks are recommended before installation.")
