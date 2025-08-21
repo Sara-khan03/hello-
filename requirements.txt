@@ -6,5 +6,4 @@ matplotlib
 pandas
 numpy
 requests
-fpdf
 plotly
