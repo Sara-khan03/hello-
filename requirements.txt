@@ -1,7 +1,8 @@
-streamlit>=1.25.0
-streamlit-folium>=0.12.0
-folium>=0.15.0
-matplotlib>=3.8.0
-pandas>=2.0.3
-numpy>=1.25.0
-requests>=2.31.0
+streamlit==1.30.0
+streamlit-folium==0.12.1
+folium==0.16.1
+numpy==1.27.5
+pandas==2.1.1
+matplotlib==3.8.1
+requests==2.31.0
+
