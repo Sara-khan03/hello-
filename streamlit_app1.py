@@ -23,29 +23,52 @@ def fetch_nasa_power_monthly(lat, lon):
     """
     Fetch monthly average GHI (ALLSKY_SFC_SW_DWN, kWh/m2/day) from NASA POWER Climatology (2001-2020)
     Returns dict: {month_name: kWh/m2/day}
-    Falls back to None on failure.
+    Falls back to one of two predefined PSH profiles if request fails.
     """
-    try:
-        base = "https://power.larc.nasa.gov/api/temporal/climatology/point"
-        params = {
-            "parameters": "ALLSKY_SFC_SW_DWN",
-            "community": "RE",
-            "longitude": lon,
-            "latitude": lat,
-            "format": "JSON"
-        }
-        r = requests.get(base, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        values = data["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]
-        month_map = {
-            "01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"May","06":"Jun",
-            "07":"Jul","08":"Aug","09":"Sep","10":"Oct","11":"Nov","12":"Dec"
-        }
-        monthly = {month_map[k]: float(v) for k,v in values.items()}
-        return monthly
-    except Exception:
-        return None
+    month_map = {
+        "01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"May","06":"Jun",
+        "07":"Jul","08":"Aug","09":"Sep","10":"Oct","11":"Nov","12":"Dec"
+    }
+
+    # Two fallback profiles
+    fallback_india = {
+        "Jan":4.5,"Feb":5.2,"Mar":6.0,"Apr":6.4,"May":6.5,"Jun":5.5,
+        "Jul":4.8,"Aug":5.0,"Sep":5.8,"Oct":5.7,"Nov":5.0,"Dec":4.6
+    }
+    fallback_global = {
+        "Jan":3.5,"Feb":4.0,"Mar":4.5,"Apr":5.0,"May":5.2,"Jun":5.0,
+        "Jul":4.8,"Aug":4.9,"Sep":4.7,"Oct":4.5,"Nov":4.0,"Dec":3.8
+    }
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            base = "https://power.larc.nasa.gov/api/temporal/climatology/point"
+            params = {
+                "parameters": "ALLSKY_SFC_SW_DWN",
+                "community": "RE",
+                "longitude": lon,
+                "latitude": lat,
+                "format": "JSON"
+            }
+            r = requests.get(base, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            values = data["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]
+            monthly = {month_map[k]: float(v) for k,v in values.items()}
+            st.success("NASA POWER monthly averages loaded successfully.")
+            return monthly
+        except Exception as e:
+            st.warning(f"Attempt {attempt+1} to fetch NASA POWER failed...")
+            time.sleep(1)
+
+    # If all attempts fail, pick fallback based on latitude
+    st.warning("Could not fetch NASA POWER data. Using fallback PSH profiles.")
+    if abs(lat) < 30:  # Near India
+        return fallback_india
+    else:
+        return fallback_global
+
 
 def days_in_months(year=2024):
     return {"Jan":31,"Feb":29 if (year%4==0 and (year%100!=0 or year%400==0)) else 28,
