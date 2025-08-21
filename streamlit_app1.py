@@ -34,7 +34,7 @@ def fetch_nasa_power_monthly(lat, lon):
             "latitude": lat,
             "format": "JSON"
         }
-        r = requests.get(base, params=params, timeout=10)
+        r = requests.get(base, params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
         values = data["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]
