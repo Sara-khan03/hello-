@@ -1,0 +1,9 @@
+streamlit
+streamlit-folium
+folium
+streamlit-option-menu
+numpy
+requests
+plotly
+matplotlib
+fpdf2
