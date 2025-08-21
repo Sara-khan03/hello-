@@ -2,8 +2,10 @@ streamlit
 streamlit-option-menu
 streamlit-folium
 folium
-matplotlib
-pandas
-numpy
 requests
+numpy
+pandas
 plotly
+matplotlib
+fpdf2
+
