@@ -351,4 +351,4 @@ elif selection == "Reports":
 # Footer note (always visible)
 # -----------------------
 st.markdown("<br><hr><p style='font-size:12px;color:gray'>© Solar Suite — estimates are indicative only. This tool does not replace professional site assessment.</p>", unsafe_allow_html=True)
-report.txt")
+
