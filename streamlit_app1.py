@@ -1,354 +1,282 @@
 # app.py
-import streamlit as st
-from streamlit_option_menu import option_menu
-from streamlit_folium import st_folium
-import folium
+# Solar Mapping & Recommendation System — Streamlit (with login, dashboard, save/load)
+import math, sqlite3
+import json, time
+from datetime import datetime
 import requests
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-import math
-from fpdf import FPDF
-from io import BytesIO
-from datetime import datetime
+import streamlit as st
+import folium
+from streamlit_folium import st_folium
+import matplotlib.pyplot as plt
 
-# -----------------------
-# Page config & staging
-# -----------------------
-st.set_page_config(page_title="Solar Suite", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Solar Mapping & Recommendation System",
+                   page_icon="☀️", layout="wide")
 
-# Ensure basic session state keys
-if "picked_point" not in st.session_state:
-    st.session_state.picked_point = None  # (lat, lon)
-if "ghi_monthly" not in st.session_state:
-    st.session_state.ghi_monthly = None
-if "area_m2" not in st.session_state:
-    st.session_state.area_m2 = None
-if "monthly_kwh" not in st.session_state:
-    st.session_state.monthly_kwh = None
-if "panels_fit" not in st.session_state:
-    st.session_state.panels_fit = None
+# ---------------------------- Database ---------------------------- #
+conn = sqlite3.connect("solar_app.db", check_same_thread=False)
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS simulations (
+    id INTEGER PRIMARY KEY, user_id INTEGER, timestamp TEXT,
+    lat REAL, lon REAL, roof_w REAL, roof_h REAL, clearance REAL,
+    panel_w REAL, panel_h REAL, panel_watt REAL, orientation TEXT,
+    performance_ratio REAL, shading_factor REAL, tilt_deg REAL,
+    cost_per_kw REAL, tariff REAL,
+    system_kw REAL, rooftop_area REAL, annual_energy REAL,
+    annual_savings REAL, payback_years REAL, suitability_score REAL
+)''')
+conn.commit()
 
-# -----------------------
-# Helper utilities
-# -----------------------
-def reverse_geocode(lat, lon):
-    """Return a place name using Nominatim (OpenStreetMap). Return None on failure."""
-    try:
-        url = "https://nominatim.openstreetmap.org/reverse"
-        params = {"lat": lat, "lon": lon, "format": "jsonv2", "zoom": 10, "addressdetails": 0}
-        r = requests.get(url, params=params, timeout=6, headers={"User-Agent": "solar-suite-app"})
-        r.raise_for_status()
-        data = r.json()
-        name = data.get("display_name") or data.get("name")
-        return name
-    except Exception:
-        return None
+# ---------------------------- Helpers ---------------------------- #
 
-def fetch_solar_ghi(lat, lon):
-    """Try NASA POWER, fallback to PVGIS, else typical 5.0. Returns (avg, monthly_dict, source)."""
-    # NASA POWER (monthly climatology)
-    try:
-        url = (
-            "https://power.larc.nasa.gov/api/temporal/climatology/point"
-            f"?parameters=ALLSKY_SFC_SW_DWN&community=RE&longitude={lon}&latitude={lat}&format=JSON"
-        )
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        dd = r.json()
-        ghi = {k: float(v) for k, v in dd["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"].items()}
-        return float(np.mean(list(ghi.values()))), ghi, "NASA POWER"
-    except Exception:
-        pass
+@st.cache_data(show_spinner=False)
+def fetch_nasa_power_monthly(lat, lon):
+    """Fetch monthly GHI (ALLSKY_SFC_SW_DWN) from NASA POWER"""
+    urls = [
+        f"https://power.larc.nasa.gov/api/temporal/climatology/point?parameters=ALLSKY_SFC_SW_DWN&community=RE&longitude={lon}&latitude={lat}&format=JSON",
+        f"https://power.larc.nasa.gov/api/temporal/climatology/point?parameters=ALLSKY_SFC_SW_DWN&community=SSE&longitude={lon}&latitude={lat}&format=JSON"
+    ]
+    month_map = {
+        "01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"May","06":"Jun",
+        "07":"Jul","08":"Aug","09":"Sep","10":"Oct","11":"Nov","12":"Dec"
+    }
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            values = data["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]
+            monthly = {month_map[k]: float(v) for k,v in values.items()}
+            return monthly
+        except:
+            continue
+    return None
 
-    # PVGIS fallback
-    try:
-        url = f"https://re.jrc.ec.europa.eu/api/DRcalc?lat={lat}&lon={lon}&outputformat=json"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        dd = r.json()
-        monthly = dd["outputs"]["monthly"]["fixed"]["E_d"]  # monthly kWh/m^2
-        days = [31,28,31,30,31,30,31,31,30,31,30,31]
-        ghi = {f"{i+1:02d}": float(monthly[i] / days[i]) for i in range(12)}
-        return float(np.mean(list(ghi.values()))), ghi, "PVGIS"
-    except Exception:
-        pass
+def days_in_months(year=2024):
+    return {"Jan":31,"Feb":29 if (year%4==0 and (year%100!=0 or year%400==0)) else 28,
+            "Mar":31,"Apr":30,"May":31,"Jun":30,"Jul":31,"Aug":31,"Sep":30,"Oct":31,"Nov":30,"Dec":31}
 
-    # Final fallback
-    ghi = {f"{i:02d}": 5.0 for i in range(1,13)}
-    return 5.0, ghi, "Fallback (5.0 typical)"
+def deg2rad(d): return d*math.pi/180.0
 
-def monthly_output_kwh(area_m2, ghi_monthly, panel_eff, coverage, tilt_deg, derate=0.75, shading_pct=10, latitude=20.0):
-    """Return list of 12 monthly kWh estimates using simple model."""
-    days_in_month = [31,28,31,30,31,30,31,31,30,31,30,31]
-    active_area = area_m2 * coverage
-    tilt_factor = max(0.5, math.cos(math.radians(tilt_deg - abs(latitude))))
-    shading_factor = max(0.0, 1 - shading_pct/100.0)
-    out = []
-    for m in range(1,13):
-        ghi = float(ghi_monthly.get(f"{m:02d}", 5.0))
-        kwh = active_area * ghi * panel_eff * tilt_factor * days_in_month[m-1] * derate * shading_factor
-        out.append(kwh)
-    return out
+def suitability_score(roof_area_m2, monthly_psh_dict, shading_factor, tilt_deg, lat):
+    if not monthly_psh_dict:
+        resource_score = 50
+    else:
+        avg_psh = np.mean(list(monthly_psh_dict.values()))
+        resource_score = np.clip(20 + (avg_psh-3)*18, 20, 95)
+    area_score = 30 + np.clip((roof_area_m2-10)*1.5, 0, 65)
+    shade_score = np.clip(100 - shading_factor*100, 10, 100)
+    ideal = abs(abs(lat) - tilt_deg)
+    tilt_score = np.clip(100 - ideal*2.2, 40, 100)
+    weights = [0.35,0.25,0.2,0.2]
+    final = resource_score*weights[0] + area_score*weights[1] + shade_score*weights[2] + tilt_score*weights[3]
+    return round(final,1)
 
-def compute_panel_fit(area_m2, coverage, panel_area_m2=1.9):
-    usable = area_m2 * coverage
-    panels = int(usable // panel_area_m2)
-    return max(0, panels)
+def compute_panels_fit(roof_w, roof_h, panel_w, panel_h, clearance, orientation="Portrait"):
+    if orientation=="Landscape": pw, ph = panel_h, panel_w
+    else: pw, ph = panel_w, panel_h
+    avail_w = max(roof_w-2*clearance,0)
+    avail_h = max(roof_h-2*clearance,0)
+    def count_axis(avail,p): return max(int((avail+clearance)//(p+clearance)),0) if p>0 else 0
+    cols = count_axis(avail_w,pw)
+    rows = count_axis(avail_h,ph)
+    count = rows*cols
+    return count, rows, cols
 
-def make_pdf_report(context):
-    """Create PDF bytes for download. Simple formatted PDF with a small chart image."""
-    from matplotlib import pyplot as plt
-    # monthly chart
-    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-    fig, ax = plt.subplots(figsize=(8,2.8))
-    ax.plot(months, context["monthly_kwh"], marker="o")
-    ax.set_title("Monthly Solar Output (kWh)")
-    ax.set_ylabel("kWh")
-    ax.grid(True, alpha=0.3)
-    tmp_chart = "/tmp/solar_chart.png"
-    fig.savefig(tmp_chart, bbox_inches="tight", dpi=150)
-    plt.close(fig)
-    # Compose PDF
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 8, "Solar Analysis Report", ln=True)
-    pdf.set_font("Arial", size=11)
-    pdf.ln(4)
-    pdf.multi_cell(0, 6, f"Location (approx): {context['place']}")
-    pdf.multi_cell(0, 6, f"Coordinates: {context['lat']:.6f}, {context['lon']:.6f}")
-    pdf.multi_cell(0, 6, f"Rooftop area estimate: {context['area_m2']:.1f} m²")
-    pdf.multi_cell(0, 6, f"Panels fit (est): {context['panels_fit']}")
-    pdf.multi_cell(0, 6, f"Estimated annual output: {sum(context['monthly_kwh']):,.0f} kWh")
-    pdf.ln(4)
-    pdf.image(tmp_chart, w=180)
-    out = BytesIO()
-    pdf.output(out)
-    out.seek(0)
-    return out
+def monthly_energy_kwh(system_kw, monthly_psh, days, performance_ratio, shading_factor):
+    return system_kw*monthly_psh*days*performance_ratio*(1-shading_factor)
 
-# -----------------------
-# Navigation menu
-# -----------------------
+FAQ = [
+    ("what is psh", "PSH = Peak Sun Hours; approx. daily solar energy in kWh per kW of PV."),
+    ("what is performance ratio", "Performance Ratio (PR) lumps system losses (temperature, wiring, inverter). Typical 0.72–0.82."),
+    ("how many panels", "Panels Fit depends on roof size and panel size/orientation with required clearances."),
+    ("best tilt", "Set tilt roughly equal to latitude for year-round balance."),
+    ("payback", "Payback Period = Install Cost / Annual Savings.")
+]
+
+def chatbot_reply(msg):
+    text = msg.lower().strip()
+    if not text: return "Ask me anything about solar sizing, costs, tilt, or payback!"
+    if "tilt" in text: return "Best tilt ≈ your latitude."
+    if "cost" in text or "price" in text: return "Install cost ≈ ₹45–65k per kW (India)."
+    if "payback" in text or "roi" in text: return "Payback = Install Cost / Annual Savings."
+    if "panel" in text and ("how many" in text or "count" in text): return "Depends on roof & panel size, orientation, and spacing."
+    for k,v in FAQ:
+        if k in text: return v
+    return "Try asking about tilt, PR, costs, or panels fit."
+
+# ---------------------------- Login / Signup ---------------------------- #
 with st.sidebar:
-    selection = option_menu(
-        menu_title="Navigation",
-        options=["Home", "Forecast", "Layout", "Chatbot", "Reports"],
-        icons=["house", "bar-chart", "grid-1x2", "chat-quote", "file-earmark-text"],
-        menu_icon="sun",
-        default_index=0,
-    )
-
-# -----------------------
-# Shared header function
-# -----------------------
-def page_header(image_url, title_line, subtitle_line=None):
-    """Show a large header image and encouraging lines at top of page."""
-    st.image(image_url, use_column_width=True)
-    st.markdown(f"### {title_line}")
-    if subtitle_line:
-        st.markdown(f"**{subtitle_line}**")
-    st.markdown("---")
-
-# -----------------------
-# Page: Home
-# -----------------------
-if selection == "Home":
-    # header image + lines
-    page_header(
-        image_url="https://images.unsplash.com/photo-1509395176047-4a66953fd231?auto=format&fit=crop&w=1600&q=80",
-        title_line="☀️ Switch to Solar — Power your future with clean energy!",
-        subtitle_line="Draw inspiration — pick a place on the map to explore its solar potential."
-    )
-
-    # main content area with map on right
-    left_col, right_col = st.columns([1, 1.2])
-    with left_col:
-        st.write("Welcome — click any point on the map at right to select a location. We will show latitude & longitude and try to resolve the city/place name.")
-        st.markdown("**Quick tips:**")
-        st.write("- Zoom into the area and click on the rooftop or nearby to pick a point.")
-        st.write("- After selecting, go to **Forecast** page for resource and energy estimates.")
-    with right_col:
-        # folium map with Esri satellite tiles and city markers
-        m = folium.Map(location=[21.0,78.0], zoom_start=5, control_scale=True)
-        folium.TileLayer(
-            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-            attr="Esri World Imagery",
-            name="Esri Satellite",
-            overlay=False,
-            control=False
-        ).add_to(m)
-        # a few sample city markers (visible)
-        sample_cities = {
-            "Delhi": (28.7041, 77.1025),
-            "Mumbai": (19.0760, 72.8777),
-            "Chennai": (13.0827, 80.2707),
-            "Kolkata": (22.5726, 88.3639),
-            "Bengaluru": (12.9716, 77.5946),
-        }
-        for city, (latc, lonc) in sample_cities.items():
-            folium.CircleMarker(location=(latc, lonc), radius=4, tooltip=city, color="orange", fill=True).add_to(m)
-        map_result = st_folium(m, width=700, height=520)
-        # handle click
-        if map_result and map_result.get("last_clicked"):
-            pt = map_result["last_clicked"]
-            lat, lon = float(pt["lat"]), float(pt["lng"])
-            st.session_state.picked_point = (lat, lon)
-            place = reverse_geocode(lat, lon) or "Unknown place"
-            st.success(f"Selected: {place} — Lat {lat:.6f}, Lon {lon:.6f}")
-
-    st.markdown("---")
-    st.info("Disclaimer: This tool provides simplified estimates for educational purposes only. Always consult a qualified installer for a final site survey and quotation.")
-
-# -----------------------
-# Page: Forecast
-# -----------------------
-elif selection == "Forecast":
-    page_header(
-        image_url="https://images.unsplash.com/photo-1509395176047-4a66953fd231?auto=format&fit=crop&w=1600&q=80",
-        title_line="📈 Solar Forecast — Know your sunshine",
-        subtitle_line="We try NASA → PVGIS → fallback to estimate monthly PSH and energy output."
-    )
-    if not st.session_state.picked_point:
-        st.warning("Please pick a point on the Home map first.")
-        st.info("Tip: go to Home, click a point on the map at right, then return here.")
-    else:
-        lat, lon = st.session_state.picked_point
-        place = reverse_geocode(lat, lon) or "Selected location"
-        st.markdown(f"**Location:** {place} — `Lat: {lat:.6f}`, `Lon: {lon:.6f}`")
-        # input: rooftop area estimate (user-provided, in m^2)
-        area_m2 = st.number_input("Estimated rooftop area (m²)", min_value=5.0, value=50.0, step=1.0)
-        st.session_state.area_m2 = area_m2
-        panel_eff = st.slider("Panel efficiency (%)", 10, 22, 18) / 100.0
-        coverage = st.slider("Coverage fraction (%)", 40, 95, 80) / 100.0
-        tilt_deg = st.slider("Tilt angle (deg)", 0, 45, 20)
-        shading_pct = st.slider("Shading loss (%)", 0, 60, 10)
-        derate = st.slider("System derate (losses fraction)", 60, 90, 75) / 100.0
-
-        ghi_avg, ghi_monthly, src = fetch_solar_ghi(lat, lon)
-        if src.startswith("Fallback"):
-            st.warning("Could not fetch NASA / PVGIS — using typical fallback PSH (5.0 kWh/m²/day).")
+    st.header("🔐 User Login / Signup")
+    choice = st.radio("Action", ["Login","Sign Up"])
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    if st.button("Submit Login/Signup"):
+        if choice=="Sign Up":
+            try:
+                c.execute("INSERT INTO users (username,password) VALUES (?,?)",(username,password))
+                conn.commit()
+                st.success("User created. Please login.")
+            except:
+                st.error("Username exists.")
         else:
-            st.success(f"Data source: {src} (avg PSH = {ghi_avg:.2f} kWh/m²/day)")
+            c.execute("SELECT id FROM users WHERE username=? AND password=?",(username,password))
+            user=c.fetchone()
+            if user: st.session_state.user_id=user[0]; st.success(f"Logged in as {username}")
+            else: st.error("Invalid credentials")
 
-        st.session_state.ghi_monthly = ghi_monthly
-        monthly_kwh = monthly_output_kwh(area_m2, ghi_monthly, panel_eff, coverage, tilt_deg, derate, shading_pct, lat)
-        st.session_state.monthly_kwh = monthly_kwh
+# ---------------------------- UI ---------------------------- #
+st.title("☀️ Solar Mapping & Recommendation System")
 
-        # Plot monthly output
-        months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-        fig = go.Figure()
-        fig.add_trace(go.Bar(x=months, y=monthly_kwh, name="kWh"))
-        fig.update_layout(title="Estimated Monthly Energy (kWh)", template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
-        st.metric("Estimated annual production (kWh)", f"{sum(monthly_kwh):,.0f}")
-        st.markdown("---")
-        st.info("Disclaimer: These are simplified estimates. A professional site survey is needed for final design and quotes.")
+# Only allow simulation if logged in
+if "user_id" not in st.session_state:
+    st.info("Please login/signup to run simulations and save results.")
+    st.stop()
 
-# -----------------------
-# Page: Layout
-# -----------------------
-elif selection == "Layout":
-    page_header(
-        image_url="https://images.unsplash.com/photo-1509395176047-4a66953fd231?auto=format&fit=crop&w=1600&q=80",
-        title_line="🔲 Panel Layout — visualize your rooftop",
-        subtitle_line="Conceptual grid layout and per-panel energy estimate (interactive)."
-    )
-    if not st.session_state.monthly_kwh or not st.session_state.area_m2:
-        st.warning("Run Forecast first (pick a location and set rooftop area).")
-    else:
-        area = st.session_state.area_m2
-        coverage = st.slider("Coverage fraction (again)", 40, 95, int(coverage*100) if 'coverage' in locals() else 80) / 100.0
-        panel_area = st.number_input("Panel area (m²) — typical ~1.7–2.0", value=1.9)
-        panels = compute_panel_fit(area, coverage, panel_area)
-        st.session_state.panels_fit = panels
-        st.write(f"Estimated panels that can fit: **{panels}**")
-        if panels <= 0:
-            st.error("Rooftop too small given coverage/panel area. Increase area or reduce panel spacing.")
-        else:
-            per_panel_kwh = sum(st.session_state.monthly_kwh) / panels
-            st.write(f"Approx annual per-panel energy: **{per_panel_kwh:.1f} kWh/yr**")
-            # simple grid visualization with Plotly markers (hover tooltips)
-            cols_guess = max(4, min(14, int(math.sqrt(panels) * 1.25)))
-            rows_guess = math.ceil(panels / cols_guess)
-            xs, ys, texts = [], [], []
-            idx = 0
-            for r in range(rows_guess):
-                for c in range(cols_guess):
-                    if idx >= panels:
-                        break
-                    xs.append(c); ys.append(-r)
-                    texts.append(f"Panel #{idx+1}<br>{per_panel_kwh:.1f} kWh/yr")
-                    idx += 1
-            layout_fig = go.Figure(data=go.Scatter(x=xs, y=ys, mode="markers",
-                                                   marker=dict(size=26, symbol="square", color="gold"),
-                                                   hovertext=texts, hoverinfo="text"))
-            layout_fig.update_layout(title="Hover panels to see per-panel annual kWh",
-                                     xaxis=dict(visible=False), yaxis=dict(visible=False),
-                                     template="plotly_white", height=420)
-            st.plotly_chart(layout_fig, use_container_width=True)
+# ---------------------------- Sidebar Inputs ---------------------------- #
+with st.sidebar:
+    st.header("Inputs")
+    default_lat, default_lon = 21.2514, 81.6296
+    lat = st.number_input("Latitude", value=float(default_lat), format="%.6f")
+    lon = st.number_input("Longitude", value=float(default_lon), format="%.6f")
     st.markdown("---")
-    st.info("Disclaimer: This layout is conceptual. Final mounting, spacing, tilts, and roof obstructions must be surveyed by an installer.")
-
-# -----------------------
-# Page: Chatbot
-# -----------------------
-elif selection == "Chatbot":
-    page_header(
-        image_url="https://images.unsplash.com/photo-1509395176047-4a66953fd231?auto=format&fit=crop&w=1600&q=80",
-        title_line="💬 Solar Assistant — ask anything",
-        subtitle_line="Type a question about solar: cost, tilt, batteries, payback, subsidies."
-    )
-    question = st.text_input("Ask your question:")
-    if question:
-        q = question.lower()
-        if "tilt" in q:
-            st.success("Rule of thumb: set tilt ≈ your latitude for year-round output. Seasonal tweaks can improve yield.")
-        elif "cost" in q or "price" in q:
-            st.success("Typical residential rooftop PV installed cost (India) ranges ~₹40,000–80,000 per kW depending on components & region.")
-        elif "battery" in q:
-            st.success("Battery sizing: daily load × desired autonomy. Nameplate = usable / DoD. Lithium systems: DoD 80–90%, RTE ~90–95%.")
-        elif "payback" in q or "savings" in q:
-            st.success("Payback depends on electricity tariff, subsidies, metering, and self-consumption. Use Forecast + Reports pages for estimates.")
-        else:
-            st.info("Good question — include keywords like 'tilt', 'cost', 'battery', or 'payback' for targeted answers.")
+    st.markdown("**Rooftop Geometry**")
+    roof_w = st.number_input("Width (m)", min_value=3.0,value=10.0,step=0.5)
+    roof_h = st.number_input("Height (m)", min_value=3.0,value=8.0,step=0.5)
+    clearance = st.number_input("Clearance (m)", min_value=0.0,value=0.4,step=0.1)
     st.markdown("---")
-    st.info("Disclaimer: Chatbot answers are general guidance only and not a substitute for professional advice.")
-
-# -----------------------
-# Page: Reports
-# -----------------------
-elif selection == "Reports":
-    page_header(
-        image_url="https://images.unsplash.com/photo-1509395176047-4a66953fd231?auto=format&fit=crop&w=1600&q=80",
-        title_line="📄 Reports — export your rooftop summary",
-        subtitle_line="Create a compact downloadable PDF with your picked-point & estimates."
-    )
-    if not st.session_state.monthly_kwh or not st.session_state.picked_point:
-        st.warning("Pick a point on Home then run Forecast to generate report data.")
-    else:
-        lat, lon = st.session_state.picked_point
-        place = reverse_geocode(lat, lon) or f"{lat:.6f}, {lon:.6f}"
-        area = st.session_state.area_m2 or 50.0
-        panels = st.session_state.panels_fit or compute_panel_fit(area, 0.8)
-        ctx = {
-            "place": place, "lat": lat, "lon": lon, "area_m2": area,
-            "panels_fit": panels, "monthly_kwh": st.session_state.monthly_kwh
-        }
-        st.write("Quick preview:")
-        st.metric("Location", place)
-        st.metric("Area (m²)", f"{area:.1f}")
-        st.metric("Panels (est)", panels)
-        st.metric("Annual energy (kWh)", f"{sum(st.session_state.monthly_kwh):,.0f}")
-        if st.button("Generate PDF Report"):
-            pdf_bytes = make_pdf_report(ctx)
-            st.download_button("Download PDF", data=pdf_bytes, file_name="solar_report.pdf", mime="application/pdf")
+    st.markdown("**Panel Specs**")
+    panel_w = st.number_input("Panel Width (m)", min_value=0.8,value=1.1,step=0.01)
+    panel_h = st.number_input("Panel Height (m)", min_value=1.2,value=1.75,step=0.01)
+    panel_watt = st.number_input("Panel Wattage (W)", min_value=200,value=400,step=10)
+    orientation = st.selectbox("Orientation", ["Portrait","Landscape"])
     st.markdown("---")
-    st.info("Disclaimer: PDF is an aid. Final technical design and invoice require a site visit and professional engineering.")
+    st.markdown("**Performance & Costs**")
+    performance_ratio = st.slider("PR",0.6,0.9,0.75,0.01)
+    shading_factor = st.slider("Shading",0.0,0.8,0.1,0.05)
+    tilt_deg = st.slider("Tilt (°)",0,60,int(abs(lat)),1)
+    cost_per_kw = st.number_input("Cost per kW (₹)", min_value=10000,value=55000,step=1000)
+    tariff = st.number_input("Electricity Tariff (₹/kWh)", min_value=2.0,value=8.0,step=0.5)
 
-# -----------------------
-# Footer note (always visible)
-# -----------------------
-st.markdown("<br><hr><p style='font-size:12px;color:gray'>© Solar Suite — estimates are indicative only. This tool does not replace professional site assessment.</p>", unsafe_allow_html=True)
+# ---------------------------- Map Picker ---------------------------- #
+st.subheader("📍 Pick Location on Map")
+m = folium.Map(location=[lat, lon], zoom_start=12)
+folium.Marker([lat, lon], tooltip="Selected Location").add_to(m)
+returned = st_folium(m,width=700,height=400)
+if returned and returned.get("last_clicked"):
+    lat = float(returned["last_clicked"]["lat"])
+    lon = float(returned["last_clicked"]["lng"])
+    with st.sidebar: st.info(f"Map selected: Lat {lat:.5f}, Lon {lon:.5f}")
 
+# ---------------------------- Fetch Resource ---------------------------- #
+st.subheader("🔆 Solar Resource (Monthly PSH)")
+monthly_psh = fetch_nasa_power_monthly(lat, lon)
+if monthly_psh is None:
+    st.warning("NASA POWER failed. Using fallback PSH (kWh/kW/day).")
+    monthly_psh = {"Jan":4.5,"Feb":5.2,"Mar":6.0,"Apr":6.4,"May":6.5,"Jun":5.5,
+                   "Jul":4.8,"Aug":5.0,"Sep":5.8,"Oct":5.7,"Nov":5.0,"Dec":4.6}
+else:
+    st.success("NASA POWER monthly averages loaded.")
+
+# ---------------------------- Panel Fit & Layout ---------------------------- #
+st.subheader("📐 Rooftop & Panel Layout")
+roof_area = roof_w*roof_h
+count, rows, cols = compute_panels_fit(roof_w, roof_h, panel_w, panel_h, clearance, orientation)
+system_kw = round((count*panel_watt)/1000.0,2)
+
+left,right = st.columns([1.2,1])
+with left:
+    fig, ax = plt.subplots(figsize=(6.5,4.5))
+    ax.set_aspect('equal'); ax.set_title(f"Layout Preview ({orientation}) — {rows}x{cols}={count}")
+    ax.add_patch(plt.Rectangle((0,0), roof_w, roof_h, fill=False,lw=2))
+    ax.add_patch(plt.Rectangle((clearance, clearance), max(roof_w-2*clearance,0), max(roof_h-2*clearance,0), fill=False,ls="--",lw=1))
+    pw,ph = (panel_h,panel_w) if orientation=="Landscape" else (panel_w,panel_h)
+    for r in range(rows):
+        for c in range(cols):
+            x=clearance+c*(pw+clearance); y=clearance+r*(ph+clearance)
+            ax.add_patch(plt.Rectangle((x,y),pw,ph,fill=False))
+    ax.set_xlim(-0.2,roof_w+0.2); ax.set_ylim(-0.2,roof_h+0.2)
+    ax.set_xlabel("Width (m)"); ax.set_ylabel("Height (m)")
+    st.pyplot(fig)
+
+with right:
+    st.metric("Rooftop Area", f"{roof_area:.1f} m²")
+    st.metric("Panels Fit", f"{count} panels")
+    st.metric("System Capacity", f"{system_kw:.2f} kW")
+
+# ---------------------------- Monthly Forecast ---------------------------- #
+st.subheader("📈 Monthly Energy Output Forecast")
+dim = days_in_months()
+months = list(monthly_psh.keys())
+monthly_energy = [monthly_energy_kwh(system_kw, monthly_psh[m], dim[m], performance_ratio, shading_factor) for m in months]
+df = pd.DataFrame({"Month":months, "PSH": [round(monthly_psh[m],2) for m in months], "Days":[dim[m] for m in months], "Energy":[round(v,1) for v in monthly_energy]})
+annual_energy = round(float(np.sum(monthly_energy)),1)
+install_cost = round(system_kw*cost_per_kw,0)
+annual_savings = round(annual_energy*tariff,0)
+payback_years = round(install_cost/max(annual_savings,1),1)
+colA,colB,colC,colD=st.columns(4)
+with colA: st.metric("Annual Solar Output",f"{annual_energy:,} kWh/yr")
+with colB: st.metric("Installation Cost",f"₹{install_cost:,.0f}")
+with colC: st.metric("Annual Savings",f"₹{annual_savings:,.0f}/yr")
+with colD: st.metric("Payback Period",f"{payback_years} years")
+st.dataframe(df,use_container_width=True)
+fig2,ax2=plt.subplots(figsize=(7,3.5))
+ax2.bar(df["Month"],df["Energy"])
+ax2.set_ylabel("Monthly Energy (kWh)"); ax2.set_title("Monthly Solar Energy Output")
+st.pyplot(fig2)
+
+# ---------------------------- Suitability ---------------------------- #
+st.subheader("✅ Suitability")
+score = suitability_score(roof_area, monthly_psh, shading_factor, tilt_deg, lat)
+explain=[]
+if score>=80: explain.append("Excellent resource & roof size.")
+elif score>=65: explain.append("Good potential — optimize tilt/spacing.")
+else: explain.append("Moderate potential — shading or area limiting.")
+if shading_factor<=0.1: explain.append("Low shading.")
+elif shading_factor<=0.3: explain.append("Some shading present.")
+else: explain.append("Significant shading.")
+explain.append(f"Tilt set to {tilt_deg}°, latitude ≈ {abs(lat):.0f}°.")
+st.progress(min(int(score),100))
+st.write(f"**Suitability Score:** {score}/100 — "+" ".join(explain))
+
+# ---------------------------- Chatbot ---------------------------- #
+st.subheader("💬 Ask the Solar Chatbot")
+if "chat" not in st.session_state: st.session_state.chat=[{"role":"assistant","content":"Hi! Ask me about panels, costs, tilt, PR, or payback."}]
+for m in st.session_state.chat:
+    with st.chat_message(m["role"]): st.write(m["content"])
+user_msg=st.chat_input("Type your question…")
+if user_msg:
+    st.session_state.chat.append({"role":"user","content":user_msg})
+    reply=chatbot_reply(user_msg)
+    st.session_state.chat.append({"role":"assistant","content":reply})
+    with st.chat_message("user"): st.write(user_msg)
+    with st.chat_message("assistant"): st.write(reply)
+
+# ---------------------------- Save Simulation ---------------------------- #
+c.execute("""INSERT INTO simulations (
+    user_id, timestamp, lat, lon, roof_w, roof_h, clearance,
+    panel_w, panel_h, panel_watt, orientation, performance_ratio,
+    shading_factor, tilt_deg, cost_per_kw, tariff,
+    system_kw, rooftop_area, annual_energy, annual_savings, payback_years, suitability_score
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+    st.session_state.user_id, datetime.now().isoformat(),
+    lat, lon, roof_w, roof_h, clearance,
+    panel_w, panel_h, panel_watt, orientation, performance_ratio,
+    shading_factor, tilt_deg, cost_per_kw, tariff,
+    system_kw, roof_area, annual_energy, annual_savings, payback_years, score
+))
+conn.commit()
+st.success("Simulation saved to your dashboard!")
+
+# ---------------------------- Dashboard ---------------------------- #
+st.subheader("📊 Your Past Simulations")
+c.execute("SELECT * FROM simulations WHERE user_id=? ORDER BY timestamp DESC",(st.session_state.user_id,))
+rows=c.fetchall()
+if rows:
+    df_hist=pd.DataFrame(rows, columns=[desc[0] for desc in c.description])
+    st.dataframe(df_hist[['timestamp','system_kw','annual_energy','annual_savings','payback_years','suitability_score']])
+else:
+    st.info("No past simulations yet.")
