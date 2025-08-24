@@ -1,6 +1,6 @@
 # app.py
 # Solar Mapping & Recommendation System — Streamlit
-# Works offline, fetches NASA POWER if online, multiple fallbacks included.
+# Adds: address search -> geocoding, satellite basemap, auto-marker.
 
 import math
 import time
@@ -17,6 +17,29 @@ st.set_page_config(page_title="Solar Mapping & Recommendation System",
                    page_icon="☀️", layout="wide")
 
 # ---------------------------- Helpers ---------------------------- #
+
+@st.cache_data(show_spinner=False)
+def geocode_address(address: str):
+    """
+    Geocode with Nominatim (OpenStreetMap). Returns (lat, lon, display_name) or (None, None, None).
+    """
+    if not address or address.strip() == "":
+        return None, None, None
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": address, "format": "json", "limit": 1}
+    headers = {"User-Agent": "SolarMappingApp/1.0 (contact: example@example.com)"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None, None, None
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
+        display = data[0].get("display_name", address)
+        return lat, lon, display
+    except Exception:
+        return None, None, None
 
 @st.cache_data(show_spinner=False)
 def fetch_nasa_power_monthly(lat, lon):
@@ -55,25 +78,28 @@ def fetch_nasa_power_monthly(lat, lon):
             r.raise_for_status()
             data = r.json()
             values = data["properties"]["parameter"]["ALLSKY_SFC_SW_DWN"]
-            monthly = {month_map[k]: float(v) for k,v in values.items()}
-            st.success("NASA POWER monthly averages loaded successfully.")
+            # Ensure ordered by month
+            ordered_keys = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
+            monthly = {
+                "Jan": float(values["JAN"]), "Feb": float(values["FEB"]), "Mar": float(values["MAR"]),
+                "Apr": float(values["APR"]), "May": float(values["MAY"]), "Jun": float(values["JUN"]),
+                "Jul": float(values["JUL"]), "Aug": float(values["AUG"]), "Sep": float(values["SEP"]),
+                "Oct": float(values["OCT"]), "Nov": float(values["NOV"]), "Dec": float(values["DEC"])
+            }
             return monthly
-        except Exception as e:
-            st.warning(f"Attempt {attempt+1} to fetch NASA POWER failed...")
-            time.sleep(1)
+        except Exception:
+            time.sleep(0.8)
 
     # If all attempts fail, pick fallback based on latitude
-    st.warning("Could not fetch NASA POWER data. Using fallback PSH profiles.")
     if abs(lat) < 30:  # Near India
         return fallback_india
     else:
         return fallback_global
 
-
 def days_in_months(year=2024):
     return {"Jan":31,"Feb":29 if (year%4==0 and (year%100!=0 or year%400==0)) else 28,
             "Mar":31,"Apr":30,"May":31,"Jun":30,"Jul":31,"Aug":31,
-            "Sep":30,"Oct":31,"Nov":30,"Dec":31}
+            "Sep":30,"Oct":31,"Nov":30,"Dec":30 if year==2024 else 31}
 
 def suitability_score(roof_area_m2, monthly_psh_dict, shading_factor, tilt_deg, lat):
     if not monthly_psh_dict:
@@ -87,7 +113,7 @@ def suitability_score(roof_area_m2, monthly_psh_dict, shading_factor, tilt_deg, 
     tilt_score = np.clip(100 - ideal*2.2, 40, 100)
     weights = [0.35, 0.25, 0.2, 0.2]
     final = resource_score*weights[0] + area_score*weights[1] + shade_score*weights[2] + tilt_score*weights[3]
-    return round(final, 1)
+    return round(float(final), 1)
 
 def compute_panels_fit(roof_w, roof_h, panel_w, panel_h, clearance, orientation="Portrait"):
     if orientation == "Landscape":
@@ -98,7 +124,8 @@ def compute_panels_fit(roof_w, roof_h, panel_w, panel_h, clearance, orientation=
     avail_h = max(roof_h - 2*clearance, 0)
     def count_axis(avail, p):
         if p <= 0: return 0
-        return max(int((avail + clearance) // (p + clearance)), 0)
+        # space panels with 'clearance' between each row/col; allow a small margin
+        return max(int((avail + clearance*0.5) // (p + clearance)), 0)
     cols = count_axis(avail_w, pw)
     rows = count_axis(avail_h, ph)
     count = rows * cols
@@ -120,7 +147,7 @@ def chatbot_reply(msg):
     if not text:
         return "Ask me anything about solar sizing, costs, tilt, or payback!"
     if "tilt" in text:
-        return "Best tilt ≈ your latitude. If you want more summer energy, tilt a bit lower; for winter, tilt higher."
+        return "Best tilt ≈ your latitude. For more summer energy, tilt a bit lower; for winter, tilt higher."
     if "cost" in text or "price" in text:
         return "Install cost ≈ ₹45–65k per kW (India). Adjust in the sidebar to match quotes in your area."
     if "payback" in text or "roi" in text:
@@ -136,70 +163,95 @@ def chatbot_reply(msg):
 
 st.title("☀️ Solar Mapping & Recommendation System")
 
+# Persist selected location in session
+if "lat" not in st.session_state: st.session_state.lat = 21.2514
+if "lon" not in st.session_state: st.session_state.lon = 81.6296
+if "zoom" not in st.session_state: st.session_state.zoom = 17
+
 with st.sidebar:
     st.header("Inputs")
-    st.markdown("**1) Location (pick on map or enter)**")
-    default_lat = 21.2514
-    default_lon = 81.6296
-    lat = st.number_input("Latitude", value=float(default_lat), format="%.6f")
-    lon = st.number_input("Longitude", value=float(default_lon), format="%.6f")
+
+    # --- Location Search ---
+    st.markdown("**1) Search a location or pick on map**")
+    search_query = st.text_input("Search address / place", placeholder="e.g., Raipur Railway Station, Chhattisgarh")
+    col_s = st.columns(2)
+    do_search = col_s[0].button("Search & Set Location")
+    if do_search and search_query:
+        lat_g, lon_g, disp = geocode_address(search_query)
+        if lat_g is not None:
+            st.session_state.lat, st.session_state.lon = lat_g, lon_g
+            st.session_state.zoom = 18
+            st.success(f"Location set to: {disp}")
+        else:
+            st.error("Could not find that place. Try being more specific.")
+
+    # Manual overrides
+    default_lat = st.number_input("Latitude", value=float(st.session_state.lat), format="%.6f")
+    default_lon = st.number_input("Longitude", value=float(st.session_state.lon), format="%.6f")
+    if (default_lat != st.session_state.lat) or (default_lon != st.session_state.lon):
+        st.session_state.lat = default_lat
+        st.session_state.lon = default_lon
+
     st.markdown("---")
     st.markdown("**2) Rooftop Geometry (Rectangular approximation)**")
     roof_w = st.number_input("Rooftop Width (m)", min_value=3.0, value=10.0, step=0.5)
     roof_h = st.number_input("Rooftop Height (m)", min_value=3.0, value=8.0, step=0.5)
     clearance = st.number_input("Clearance / Spacing (m)", min_value=0.0, value=0.4, step=0.1)
+
     st.markdown("---")
     st.markdown("**3) Panel Specs**")
     panel_w = st.number_input("Panel Width (m)", min_value=0.8, value=1.1, step=0.01)
     panel_h = st.number_input("Panel Height (m)", min_value=1.2, value=1.75, step=0.01)
     panel_watt = st.number_input("Panel Wattage (W)", min_value=200, value=400, step=10)
     orientation = st.selectbox("Panel Orientation", ["Portrait", "Landscape"])
+
     st.markdown("---")
     st.markdown("**4) Performance & Costs**")
     performance_ratio = st.slider("Performance Ratio (PR)", 0.6, 0.9, 0.75, 0.01)
     shading_factor = st.slider("Shading Factor (0=None, 0.3=Medium, 0.6=High)", 0.0, 0.8, 0.1, 0.05)
-    tilt_deg = st.slider("Tilt (°)", 0, 60, int(abs(lat)), 1)
+    tilt_deg = st.slider("Tilt (°)", 0, 60, int(abs(st.session_state.lat)), 1)
     cost_per_kw = st.number_input("Installation Cost per kW (₹/kW)", min_value=10000, value=55000, step=1000)
     tariff = st.number_input("Electricity Tariff (₹/kWh)", min_value=2.0, value=8.0, step=0.5)
-    st.markdown("---")
-    st.caption("Tip: Click a point on the map to autofill Latitude/Longitude.")
+    st.caption("Tip: Click the map to set location, or type an address then press 'Search & Set Location'.")
 
-# ---------------------------- Map Picker ---------------------------- #
-st.subheader("📍 Pick Location on Map")
-m = folium.Map(location=[lat, lon], zoom_start=12)
-folium.Marker([lat, lon], tooltip="Selected Location").add_to(m)
-returned = st_folium(m, width=700, height=400)
-if returned and "last_clicked" in returned and returned["last_clicked"] is not None:
-    lat = float(returned["last_clicked"]["lat"])
-    lon = float(returned["last_clicked"]["lng"])
-    with st.sidebar:
-        st.info(f"Map selected: Lat {lat:.5f}, Lon {lon:.5f}")
+# ---------------------------- Map Picker (Satellite + Streets) ---------------------------- #
+st.subheader("📍 Pick Location on Map (Satellite)")
+
+lat = float(st.session_state.lat)
+lon = float(st.session_state.lon)
+
+m = folium.Map(location=[lat, lon], zoom_start=st.session_state.zoom, tiles=None)
+
+# Satellite layer (Esri World Imagery) + Streets (OSM)
+folium.TileLayer(
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    attr="Esri World Imagery",
+    name="Satellite (Esri)"
+).add_to(m)
+folium.TileLayer("OpenStreetMap", name="Streets").add_to(m)
+
+# Add marker and lat/lon popup
+folium.Marker([lat, lon], tooltip="Selected Location", popup=f"{lat:.6f}, {lon:.6f}").add_to(m)
+m.add_child(folium.LatLngPopup())
+folium.LayerControl(collapsed=False).add_to(m)
+
+map_state = st_folium(m, width=None, height=420)
+if map_state and map_state.get("last_clicked"):
+    st.session_state.lat = float(map_state["last_clicked"]["lat"])
+    st.session_state.lon = float(map_state["last_clicked"]["lng"])
+    st.session_state.zoom = int(map_state.get("zoom", st.session_state.zoom))
+    st.success(f"Location updated from map: {st.session_state.lat:.6f}, {st.session_state.lon:.6f}")
+    lat, lon = st.session_state.lat, st.session_state.lon
 
 # ---------------------------- Solar Resource ---------------------------- #
 st.subheader("🔆 Solar Resource (Monthly PSH)")
 
 def fetch_monthly_psh(lat, lon):
     monthly_psh = fetch_nasa_power_monthly(lat, lon)
-    if monthly_psh is not None:
-        st.success("NASA POWER monthly averages loaded (ALLSKY_SFC_SW_DWN).")
-        return monthly_psh
-    else:
-        st.warning("Could not fetch NASA POWER data. Using fallback PSH profiles.")
-    fallback_india = {
-        "Jan":4.5,"Feb":5.2,"Mar":6.0,"Apr":6.4,"May":6.5,"Jun":5.5,
-        "Jul":4.8,"Aug":5.0,"Sep":5.8,"Oct":5.7,"Nov":5.0,"Dec":4.6
-    }
-    fallback_generic = {
-        "Jan":3.8,"Feb":4.5,"Mar":5.5,"Apr":5.8,"May":6.0,"Jun":5.0,
-        "Jul":4.2,"Aug":4.5,"Sep":5.0,"Oct":5.2,"Nov":4.5,"Dec":4.0
-    }
-    # Use fallback_india first, else generic
-    if fallback_india:
-        return fallback_india
-    else:
-        return fallback_generic
+    return monthly_psh
 
 monthly_psh = fetch_monthly_psh(lat, lon)
+st.caption("Source: NASA POWER (ALLSKY_SFC_SW_DWN, climatology).")
 
 # ---------------------------- Panel Fit & System Size ---------------------------- #
 st.subheader("📐 Rooftop & Panel Layout")
@@ -229,6 +281,7 @@ with left:
     st.pyplot(fig)
 
 with right:
+    st.metric("Location", f"{lat:.4f}, {lon:.4f}")
     st.metric("Rooftop Area", f"{roof_area:.1f} m²")
     st.metric("Panels Fit", f"{count} panels")
     st.metric("System Capacity", f"{system_kw:.2f} kW")
